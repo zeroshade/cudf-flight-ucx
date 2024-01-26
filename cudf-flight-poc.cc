@@ -446,7 +446,7 @@ class StreamReader {
         std::unique_lock<std::mutex> guard(polling_mutex_);
         for (auto it = polling_map_.begin(); it != polling_map_.end();) {
           auto maybe_tag =
-              data_cnxn_->ProbeForTag(ucp_tag_t(it->first), 0x00000000000000FF, 1);
+              data_cnxn_->ProbeForTag(ucp_tag_t(it->first), 0x00000000FFFFFFFF, 1);
           if (!maybe_tag.ok()) {
             ARROW_LOG(ERROR) << maybe_tag.status().ToString();
             return;
@@ -476,7 +476,7 @@ class StreamReader {
     }    
   }
 
-  static constexpr uint64_t kbody_mask_ = 0x80000000000000;
+  static constexpr uint64_t kbody_mask_ = 0x0100000000000000;
 
   arrow::Status RecvTag(ucp_tag_message_h msg, ucp_tag_recv_info_t info_tag,
                         PendingMsg pending) {
