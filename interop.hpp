@@ -26,8 +26,7 @@
 
 arrow::Status to_arrow_device_arr(
     std::shared_ptr<cudf::table> input, struct ArrowDeviceArray* out,
-    rmm::cuda_stream_view stream = cudf::get_default_stream(),
-    arrow::MemoryPool* ar_mr = arrow::default_memory_pool());
+    rmm::cuda_stream_view stream = cudf::get_default_stream());
 
 arrow::Result<std::shared_ptr<arrow::Schema>> to_arrow_schema(
     const cudf::io::table_with_metadata& tbl);

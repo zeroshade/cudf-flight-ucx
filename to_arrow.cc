@@ -95,14 +95,9 @@ std::shared_ptr<arrow::DataType> to_arrow_datatype(cudf::type_id id) {
   }
 }
 
-arrow::Result<struct ArrowArray*> get_null_arr(int sz, arrow::MemoryPool* ar_mr) {
+void get_null_arr(int sz, struct ArrowArray* out) {
   auto arr = std::make_shared<arrow::NullArray>(sz);
-  struct ArrowArray* out;
-  ARROW_RETURN_NOT_OK(
-      ar_mr->Allocate(sizeof(struct ArrowArray), reinterpret_cast<uint8_t**>(&out)));
-
-  ARROW_RETURN_NOT_OK(arrow::ExportArray(*arr, out));
-  return out;
+  ARROW_UNUSED(arrow::ExportArray(*arr, out));
 }
 
 struct dispatch_to_arrow_type {
@@ -154,18 +149,22 @@ std::shared_ptr<arrow::DataType> dispatch_to_arrow_type::operator()<cudf::string
 template <>
 std::shared_ptr<arrow::DataType> dispatch_to_arrow_type::operator()<cudf::dictionary32>(
     cudf::column_view input, cudf::type_id id, cudf::io::column_name_info const& meta) {
-  CUDF_FAIL("Unsupported type for to_arrow_schema");
+  cudf::dictionary_column_view dview{input};
+
+  return arrow::dictionary(to_arrow_datatype(dview.indices().type().id()),
+                           to_arrow_datatype(dview.keys_type().id()));
 }
+
+template <>
+std::shared_ptr<arrow::DataType> dispatch_to_arrow_type::operator()<cudf::struct_view>(
+    cudf::column_view input, cudf::type_id id, cudf::io::column_name_info const& meta);
 
 template <>
 std::shared_ptr<arrow::DataType> dispatch_to_arrow_type::operator()<cudf::list_view>(
     cudf::column_view input, cudf::type_id id, cudf::io::column_name_info const& meta) {
-  CUDF_FAIL("Unsupported type for to_arrow_schema");
-  // auto child = input.child(0);
-  // return arrow::list(cudf::type_dispatcher(child.type(),
-  // detail::dispatch_to_arrow_type{},
-  //                                          child, child.type().id(),
-  //                                          meta.children_meta[0]));
+  auto child = input.child(0);
+  return arrow::list(cudf::type_dispatcher(child.type(), detail::dispatch_to_arrow_type{},
+                                           child, child.type().id(), meta.children[0]));
 }
 
 template <>
@@ -190,33 +189,40 @@ std::shared_ptr<arrow::DataType> dispatch_to_arrow_type::operator()<cudf::struct
   return std::make_shared<arrow::StructType>(fields);
 }
 
+namespace {
+struct ExportedPrivateData {
+  std::array<const void*, 3> buffers_;
+  struct ArrowArray dictionary_;
+  std::vector<struct ArrowArray> children_;
+  std::vector<struct ArrowArray*> child_ptrs_;
+
+  ExportedPrivateData() = default;
+  ARROW_DEFAULT_MOVE_AND_ASSIGN(ExportedPrivateData);
+  ARROW_DISALLOW_COPY_AND_ASSIGN(ExportedPrivateData);
+};
+
+}  // namespace
+
 struct dispatch_to_arrow {
   template <typename T, CUDF_ENABLE_IF(not cudf::is_rep_layout_compatible<T>())>
-  arrow::Result<struct ArrowArray*> operator()(cudf::column_view, cudf::type_id,
-                                               arrow::MemoryPool*,
-                                               rmm::cuda_stream_view) {
+  void operator()(cudf::column_view, cudf::type_id, struct ArrowArray* out,
+                  rmm::cuda_stream_view) {
     CUDF_FAIL("Unsupported type for to_arrow");
   }
 
   template <typename T, CUDF_ENABLE_IF(cudf::is_rep_layout_compatible<T>())>
-  arrow::Result<struct ArrowArray*> operator()(cudf::column_view input_view,
-                                               cudf::type_id id, arrow::MemoryPool* ar_mr,
-                                               rmm::cuda_stream_view stream) {
-    struct ArrowArray* out;
-    ARROW_RETURN_NOT_OK(
-        ar_mr->Allocate(sizeof(struct ArrowArray), reinterpret_cast<uint8_t**>(&out)));
-    memset(out, 0, sizeof(struct ArrowArray));
+  void operator()(cudf::column_view input_view, cudf::type_id, struct ArrowArray* out,
+                  rmm::cuda_stream_view) {
+    std::memset(out, 0, sizeof(struct ArrowArray));
 
-    const void** buffers;
-    ARROW_RETURN_NOT_OK(ar_mr->Allocate(
-        sizeof(void*) * 2, reinterpret_cast<uint8_t**>(const_cast<void***>(&buffers))));
+    const void** buffers = (const void**)(malloc(sizeof(void*) * 2));
     buffers[0] = input_view.null_mask();
-    buffers[1] = input_view.data<T>();
+    buffers[1] = input_view.head<T>();
 
     *out = (struct ArrowArray){
         .length = input_view.size(),
         .null_count = input_view.null_count(),
-        .offset = 0,
+        .offset = input_view.offset(),
         .n_buffers = 2,
         .n_children = 0,
         .buffers = buffers,
@@ -224,53 +230,45 @@ struct dispatch_to_arrow {
         .dictionary = nullptr,
         .release =
             [](struct ArrowArray* arr) {
-              auto* pool = reinterpret_cast<arrow::MemoryPool*>(arr->private_data);
-              pool->Free(
-                  const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(arr->buffers)),
-                  sizeof(void*) * 2);
+              free(arr->buffers);
               ArrowArrayMarkReleased(arr);
             },
-        .private_data = reinterpret_cast<void*>(ar_mr),
+        .private_data = nullptr,
     };
-    return out;
   }
 };
 
 template <>
-arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<numeric::decimal32>(
-    cudf::column_view input, cudf::type_id id, arrow::MemoryPool* ar_mr,
-    rmm::cuda_stream_view stream) {
+void dispatch_to_arrow::operator()<numeric::decimal32>(cudf::column_view, cudf::type_id,
+                                                       struct ArrowArray* out,
+                                                       rmm::cuda_stream_view) {
   CUDF_FAIL("Unsupported type for to_arrow");
 }
 
 template <>
-arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<numeric::decimal64>(
-    cudf::column_view input, cudf::type_id id, arrow::MemoryPool* ar_mr,
-    rmm::cuda_stream_view stream) {
+void dispatch_to_arrow::operator()<numeric::decimal64>(cudf::column_view, cudf::type_id,
+                                                       struct ArrowArray* out,
+                                                       rmm::cuda_stream_view) {
   CUDF_FAIL("Unsupported type for to_arrow");
 }
 
 template <>
-arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<numeric::decimal128>(
-    cudf::column_view input, cudf::type_id id, arrow::MemoryPool* ar_mr,
-    rmm::cuda_stream_view stream) {
+void dispatch_to_arrow::operator()<numeric::decimal128>(cudf::column_view input,
+                                                        cudf::type_id,
+                                                        struct ArrowArray* out,
+                                                        rmm::cuda_stream_view) {
   using DeviceType = __int128_t;
 
-  struct ArrowArray* out;
-  ARROW_RETURN_NOT_OK(
-      ar_mr->Allocate(sizeof(struct ArrowArray), reinterpret_cast<uint8_t**>(&out)));
-  memset(out, 0, sizeof(struct ArrowArray));
+  std::memset(out, 0, sizeof(struct ArrowArray));
 
-  const void** buffers;
-  ARROW_RETURN_NOT_OK(ar_mr->Allocate(
-      sizeof(void*) * 2, reinterpret_cast<uint8_t**>(const_cast<void**>(buffers))));
+  const void** buffers = (const void**)(malloc(sizeof(void*) * 2));
   buffers[0] = input.null_mask();
-  buffers[1] = input.data<DeviceType>();
+  buffers[1] = input.head<DeviceType>();
 
   *out = (struct ArrowArray){
       .length = input.size(),
       .null_count = input.null_count(),
-      .offset = 0,
+      .offset = input.offset(),
       .n_buffers = 2,
       .n_children = 0,
       .buffers = buffers,
@@ -278,86 +276,75 @@ arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<numeric::decimal
       .dictionary = nullptr,
       .release =
           [](struct ArrowArray* arr) {
-            auto* pool = reinterpret_cast<arrow::MemoryPool*>(arr->private_data);
-            pool->Free(
-                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(*arr->buffers)),
-                sizeof(void*) * 2);
+            free(arr->buffers);
             ArrowArrayMarkReleased(arr);
           },
-      .private_data = reinterpret_cast<void*>(ar_mr),
+      .private_data = nullptr,
   };
-  return out;
 }
 
-struct boolctx {
-  arrow::MemoryPool* pool;
+struct boolctx : public ExportedPrivateData {
   std::unique_ptr<rmm::device_buffer> buf;
 };
 
 template <>
-arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<bool>(
-    cudf::column_view input, cudf::type_id id, arrow::MemoryPool* ar_mr,
-    rmm::cuda_stream_view stream) {
-  auto bitmask =
-      cudf::detail::bools_to_mask(input, stream, rmm::mr::get_current_device_resource());
-  struct ArrowArray* out;
-  ARROW_RETURN_NOT_OK(
-      ar_mr->Allocate(sizeof(struct ArrowArray), reinterpret_cast<uint8_t**>(&out)));
-  memset(out, 0, sizeof(struct ArrowArray));
+void dispatch_to_arrow::operator()<bool>(cudf::column_view input, cudf::type_id id,
+                                         struct ArrowArray* out,
+                                         rmm::cuda_stream_view stream) {
+  std::memset(out, 0, sizeof(struct ArrowArray));
 
-  const void** buffers;
-  ARROW_RETURN_NOT_OK(ar_mr->Allocate(
-      sizeof(void*) * 2, reinterpret_cast<uint8_t**>(const_cast<void***>(&buffers))));
-  buffers[0] = input.null_mask();
-  buffers[1] = bitmask.first->data();
+  cudf::column_view view_without_offset = input;
+  if (input.offset()) {
+    view_without_offset =
+        cudf::column_view{input.type(), input.size() + input.offset(), input.head(),
+                          input.null_mask(), input.null_count()};
+  }
+  auto bitmask = cudf::detail::bools_to_mask(view_without_offset, stream,
+                                             rmm::mr::get_current_device_resource());
+
+  auto* pdata = new boolctx();
+  pdata->buf = std::move(bitmask.first);
+  pdata->buffers_[0] = input.null_mask();
+  pdata->buffers_[1] = bitmask.first->data();
 
   *out = (struct ArrowArray){
       .length = input.size(),
       .null_count = input.null_count(),
-      .offset = 0,
+      .offset = input.offset(),
       .n_buffers = 2,
       .n_children = 0,
-      .buffers = buffers,
+      .buffers = pdata->buffers_.data(),
       .children = nullptr,
       .dictionary = nullptr,
       .release =
           [](struct ArrowArray* arr) {
             auto* ctx = reinterpret_cast<boolctx*>(arr->private_data);
-            ctx->buf.reset();
-            ctx->pool->Free(
-                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(arr->buffers)),
-                sizeof(void*) * 2);
             delete ctx;
             ArrowArrayMarkReleased(arr);
           },
-      .private_data = new boolctx{ar_mr, std::move(bitmask.first)},
+      .private_data = pdata,
   };
-  return out;
 }
 
-struct empty_string_ctx {
-  arrow::MemoryPool* pool;
+struct empty_string_ctx : public ExportedPrivateData {
   rmm::device_scalar<int32_t> zero;
+
+  empty_string_ctx(rmm::device_scalar<int32_t>&& z) : zero{std::move(z)} {}
 };
 
 template <>
-arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<cudf::string_view>(
-    cudf::column_view input, cudf::type_id id, arrow::MemoryPool* ar_mr,
-    rmm::cuda_stream_view stream) {
-  struct ArrowArray* out;
-  ARROW_RETURN_NOT_OK(
-      ar_mr->Allocate(sizeof(struct ArrowArray), reinterpret_cast<uint8_t**>(&out)));
-  memset(out, 0, sizeof(struct ArrowArray));
+void dispatch_to_arrow::operator()<cudf::string_view>(cudf::column_view input,
+                                                      cudf::type_id id,
+                                                      struct ArrowArray* out,
+                                                      rmm::cuda_stream_view stream) {
+  std::memset(out, 0, sizeof(struct ArrowArray));
 
-  const void** buffers;
-  ARROW_RETURN_NOT_OK(ar_mr->Allocate(
-      sizeof(void*) * 3, reinterpret_cast<uint8_t**>(const_cast<void***>(&buffers))));
   if (input.size() == 0) {
     // empty array should have single offset value of 4 bytes
-    auto zero = rmm::device_scalar<int32_t>(0, stream);
-    buffers[0] = nullptr;
-    buffers[1] = reinterpret_cast<const void*>(zero.data());
-    buffers[2] = nullptr;
+    auto* pdata = new empty_string_ctx(rmm::device_scalar<int32_t>(0, stream));
+    pdata->buffers_[0] = nullptr;
+    pdata->buffers_[1] = reinterpret_cast<const void*>(pdata->zero.data());
+    pdata->buffers_[2] = nullptr;
 
     *out = (struct ArrowArray){
         .length = 0,
@@ -365,31 +352,30 @@ arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<cudf::string_vie
         .offset = 0,
         .n_buffers = 3,
         .n_children = 0,
-        .buffers = buffers,
+        .buffers = pdata->buffers_.data(),
         .children = nullptr,
         .dictionary = nullptr,
         .release =
             [](struct ArrowArray* arr) {
               auto* ctx = reinterpret_cast<empty_string_ctx*>(arr->private_data);
-              ctx->pool->Free(
-                  const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(arr->buffers)),
-                  sizeof(void*) * 3);
               delete ctx;
               ArrowArrayMarkReleased(arr);
             },
-        .private_data = new empty_string_ctx{ar_mr, std::move(zero)},
+        .private_data = pdata,
     };
-    return out;
+    return;
   }
 
-  buffers[0] = input.null_mask();
-  buffers[1] = input.child(0).data<int32_t>();
-  buffers[2] = input.child(1).data<const char>();
+  cudf::strings_column_view sview{input};
+  const void** buffers = (const void**)(malloc(sizeof(void*) * 3));
+  buffers[0] = sview.null_mask();
+  buffers[1] = sview.offsets().head<int32_t>();
+  buffers[2] = sview.chars().head<const char>();
 
   *out = (struct ArrowArray){
-      .length = input.size(),
-      .null_count = input.null_count(),
-      .offset = 0,
+      .length = sview.size(),
+      .null_count = sview.null_count(),
+      .offset = sview.offset(),
       .n_buffers = 3,
       .n_children = 0,
       .buffers = buffers,
@@ -397,76 +383,188 @@ arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<cudf::string_vie
       .dictionary = nullptr,
       .release =
           [](struct ArrowArray* arr) {
-            auto* pool = reinterpret_cast<arrow::MemoryPool*>(arr->private_data);
-            pool->Free(
-                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(arr->buffers)),
-                sizeof(void*) * 3);
+            free(arr->buffers);
             ArrowArrayMarkReleased(arr);
           },
-      .private_data = reinterpret_cast<void*>(ar_mr),
+      .private_data = nullptr,
   };
-  return out;
 }
 
 template <>
-arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<cudf::struct_view>(
-    cudf::column_view input, cudf::type_id id, arrow::MemoryPool* ar_mr,
-    rmm::cuda_stream_view stream) {
-  CUDF_FAIL("Unsupported type for to_arrow");
+void dispatch_to_arrow::operator()<cudf::list_view>(cudf::column_view input,
+                                                    cudf::type_id id,
+                                                    struct ArrowArray* out,
+                                                    rmm::cuda_stream_view stream);
+
+template <>
+void dispatch_to_arrow::operator()<cudf::dictionary32>(cudf::column_view input,
+                                                       cudf::type_id id,
+                                                       struct ArrowArray* out,
+                                                       rmm::cuda_stream_view stream);
+
+template <>
+void dispatch_to_arrow::operator()<cudf::struct_view>(cudf::column_view input,
+                                                      cudf::type_id id,
+                                                      struct ArrowArray* out,
+                                                      rmm::cuda_stream_view stream) {
+  std::memset(out, 0, sizeof(struct ArrowArray));
+
+  auto* pdata = new ExportedPrivateData();
+  pdata->buffers_[0] = input.null_mask();
+
+  pdata->children_.resize(input.num_children());
+  pdata->child_ptrs_.reserve(input.num_children());
+  cudf::structs_column_view sview{input};
+  for (auto i = 0; i < sview.num_children(); i++) {
+    auto* child = &pdata->children_[i];
+    auto c = sview.child(i);
+    c.type().id() != cudf::type_id::EMPTY
+        ? cudf::type_dispatcher(c.type(), detail::dispatch_to_arrow{}, c, c.type().id(),
+                                child, stream)
+        : detail::get_null_arr(c.size(), child);
+    pdata->child_ptrs_.push_back(child);
+  }
+
+  *out = (struct ArrowArray){
+      .length = sview.size(),
+      .null_count = sview.null_count(),
+      .offset = sview.offset(),
+      .n_buffers = 1,
+      .n_children = sview.num_children(),
+      .buffers = pdata->buffers_.data(),
+      .children = pdata->child_ptrs_.data(),
+      .dictionary = nullptr,
+      .release =
+          [](struct ArrowArray* arr) {
+            auto* ctx = reinterpret_cast<ExportedPrivateData*>(arr->private_data);
+            for (auto& c : ctx->child_ptrs_) {
+              ArrowArrayRelease(c);
+            }
+            delete ctx;
+            ArrowArrayMarkReleased(arr);
+          },
+      .private_data = pdata,
+  };
 }
 
 template <>
-arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<cudf::list_view>(
-    cudf::column_view input, cudf::type_id id, arrow::MemoryPool* ar_mr,
-    rmm::cuda_stream_view stream) {
-  CUDF_FAIL("Unsupported type for to_arrow");
+void dispatch_to_arrow::operator()<cudf::list_view>(cudf::column_view input,
+                                                    cudf::type_id id,
+                                                    struct ArrowArray* out,
+                                                    rmm::cuda_stream_view stream) {
+  std::memset(out, 0, sizeof(struct ArrowArray));
+
+  cudf::lists_column_view lview{input};
+  auto* pdata = new ExportedPrivateData();
+  auto sliced_offsets = cudf::slice(
+      lview.offsets(), {input.offset(), input.offset() + input.size() + 1}, stream)[0];
+
+  pdata->buffers_[0] = input.null_mask();
+  pdata->buffers_[1] = sliced_offsets.head<const uint8_t>();
+  pdata->children_.resize(1);
+  pdata->child_ptrs_.resize(1);
+
+  auto c = lview.child();
+  c.type().id() != cudf::type_id::EMPTY
+      ? cudf::type_dispatcher(c.type(), detail::dispatch_to_arrow{}, c, c.type().id(),
+                              &pdata->children_[0], stream)
+      : detail::get_null_arr(c.size(), &pdata->children_[0]);
+  pdata->child_ptrs_[0] = &pdata->children_[0];
+
+  *out = (struct ArrowArray){
+      .length = lview.size(),
+      .null_count = lview.null_count(),
+      .offset = lview.offset(),
+      .n_buffers = 2,
+      .n_children = 1,
+      .buffers = pdata->buffers_.data(),
+      .children = pdata->child_ptrs_.data(),
+      .dictionary = nullptr,
+      .release =
+          [](struct ArrowArray* arr) {
+            auto* ctx = reinterpret_cast<ExportedPrivateData*>(arr->private_data);
+            ArrowArrayRelease(ctx->child_ptrs_[0]);
+            delete ctx;
+            ArrowArrayMarkReleased(arr);
+          },
+      .private_data = pdata,
+  };
 }
 
 template <>
-arrow::Result<struct ArrowArray*> dispatch_to_arrow::operator()<cudf::dictionary32>(
-    cudf::column_view input, cudf::type_id id, arrow::MemoryPool* ar_mr,
-    rmm::cuda_stream_view stream) {
-  CUDF_FAIL("Unsupported type for to_arrow");
+void dispatch_to_arrow::operator()<cudf::dictionary32>(cudf::column_view input,
+                                                       cudf::type_id id,
+                                                       struct ArrowArray* out,
+                                                       rmm::cuda_stream_view stream) {
+  std::memset(out, 0, sizeof(struct ArrowArray));
+
+  cudf::dictionary_column_view dview{input};
+  auto indices_view = dview.indices();
+
+  auto* pdata = new ExportedPrivateData();
+  pdata->buffers_[0] = dview.null_mask();
+  pdata->buffers_[1] = dview.indices().head<const uint8_t>();
+
+  auto keys = dview.keys();
+  cudf::type_dispatcher(keys.type(), detail::dispatch_to_arrow{}, keys, keys.type().id(),
+                        &pdata->dictionary_, stream);
+
+  *out = (struct ArrowArray){
+      .length = dview.size(),
+      .null_count = dview.null_count(),
+      .offset = dview.offset(),
+      .n_buffers = 2,
+      .n_children = 0,
+      .buffers = pdata->buffers_.data(),
+      .children = nullptr,
+      .dictionary = &pdata->dictionary_,
+      .release =
+          [](struct ArrowArray* arr) {
+            auto* ctx = reinterpret_cast<ExportedPrivateData*>(arr->private_data);
+            ArrowArrayRelease(&ctx->dictionary_);
+            delete ctx;
+            ArrowArrayMarkReleased(arr);
+          },
+      .private_data = pdata,
+  };
 }
 
 }  // namespace detail
 
-struct dev_arr_ctx {
+struct dev_arr_ctx : public detail::ExportedPrivateData {
   std::shared_ptr<cudf::table> tbl;
-  std::vector<struct ArrowArray*> children;
-  arrow::MemoryPool* pool;
   cudaEvent_t ev;
 };
 
 arrow::Status to_arrow_device_arr(std::shared_ptr<cudf::table> input,
                                   struct ArrowDeviceArray* out,
-                                  rmm::cuda_stream_view stream,
-                                  arrow::MemoryPool* ar_mr) {
+                                  rmm::cuda_stream_view stream) {
   CUDF_EXPECTS(out != nullptr, "must not provide nullptr for ArrowDeviceArray* out var");
   std::memset(out, 0, sizeof(struct ArrowDeviceArray));
 
   auto input_view = input->view();
-  std::vector<struct ArrowArray*> children;
-  std::transform(input_view.begin(), input_view.end(), std::back_inserter(children),
-                 [&](auto const& c) {
-                   return c.type().id() != cudf::type_id::EMPTY
-                              ? *cudf::type_dispatcher(c.type(),
-                                                       detail::dispatch_to_arrow{}, c,
-                                                       c.type().id(), ar_mr, stream)
-                              : *detail::get_null_arr(c.size(), ar_mr);
+  auto* pdata = new dev_arr_ctx();
+
+  pdata->child_ptrs_.reserve(input->num_columns());
+  pdata->children_.resize(input->num_columns());
+  std::transform(input_view.begin(), input_view.end(), pdata->children_.begin(),
+                 std::back_inserter(pdata->child_ptrs_), [&](auto const& c, auto& child) {
+                   c.type().id() != cudf::type_id::EMPTY
+                       ? cudf::type_dispatcher(c.type(), detail::dispatch_to_arrow{}, c,
+                                               c.type().id(), &child, stream)
+                       : detail::get_null_arr(c.size(), &child);
+                   return &child;
                  });
 
-  dev_arr_ctx* ctx =
-      new dev_arr_ctx{std::move(input), std::move(children), ar_mr, nullptr};
-  cudaEventCreate(&ctx->ev);
+  pdata->tbl = std::move(input);
+  cudaEventCreate(&pdata->ev);
 
-  auto status = cudaEventRecord(ctx->ev, stream);
+  auto status = cudaEventRecord(pdata->ev, stream);
   if (status != cudaSuccess) {
-    for (auto& c : ctx->children) {
-      c->release(c);
-      ctx->pool->Free(reinterpret_cast<uint8_t*>(c), sizeof(struct ArrowArray));
+    for (auto& c : pdata->children_) {
+      c.release(&c);
     }
-    delete ctx;
+    delete pdata;
     return arrow::Status::ExecutionError(cudaGetErrorName(status),
                                          cudaGetErrorString(status));
   }
@@ -474,31 +572,29 @@ arrow::Status to_arrow_device_arr(std::shared_ptr<cudf::table> input,
   *out = (struct ArrowDeviceArray){
       .array =
           (struct ArrowArray){
-              .length = ctx->tbl->num_rows(),
+              .length = pdata->tbl->num_rows(),
               .null_count = 0,
               .offset = 0,
               .n_buffers = 1,
-              .n_children = ctx->tbl->num_columns(),
-              .buffers = (const void**)(malloc(sizeof(void*))),
-              .children = ctx->children.data(),
+              .n_children = pdata->tbl->num_columns(),
+              .buffers = pdata->buffers_.data(),
+              .children = pdata->child_ptrs_.data(),
               .dictionary = nullptr,
               .release =
                   [](struct ArrowArray* arr) {
                     auto* ctx = reinterpret_cast<dev_arr_ctx*>(arr->private_data);
-                    free(arr->buffers);
-                    for (auto& c : ctx->children) {
+                    for (auto& c : ctx->child_ptrs_) {
                       ArrowArrayRelease(c);
-                      ctx->pool->Free(reinterpret_cast<uint8_t*>(c),
-                                      sizeof(struct ArrowArray));
                     }
+                    cudaEventDestroy(ctx->ev);
                     delete ctx;
                     ArrowArrayMarkReleased(arr);
                   },
-              .private_data = ctx,
+              .private_data = pdata,
           },
       .device_id = rmm::get_current_cuda_device().value(),
       .device_type = ARROW_DEVICE_CUDA,
-      .sync_event = &ctx->ev,
+      .sync_event = &pdata->ev,
   };
 
   out->array.buffers[0] = nullptr;
